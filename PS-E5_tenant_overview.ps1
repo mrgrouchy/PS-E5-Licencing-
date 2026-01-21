@@ -1,9 +1,9 @@
 # Requires: Microsoft.Graph, ActiveDirectory, & ExchangeOnlineManagement Modules
-Import-Module ActiveDirectory, ExchangeOnlineManagement
+Import-Module ExchangeOnlineManagement
 
 Write-Host "🔄 Building E5 License Landscape Report..." -ForegroundColor Cyan
 
-# Target SKUs only (as requested)
+# Target SKUs ONLY (ENTERPRISEPREMIUM + SPE_E5)
 $targetSkuMap = @{
     "ENTERPRISEPREMIUM" = ""
     "SPE_E5" = ""
@@ -12,9 +12,11 @@ $targetSkuMap = @{
 Connect-MgGraph -Scopes "User.Read.All","Directory.Read.All"
 $skus = Get-MgSubscribedSku
 
-# Map target SKUs only
+# Map target SKUs
 $targetSkuIds = @()
+$skuIdToName = @{}
 foreach ($sku in $skus) {
+    $skuIdToName[$sku.SkuId] = $sku.SkuPartNumber
     if ($targetSkuMap.ContainsKey($sku.SkuPartNumber)) {
         $targetSkuMap[$sku.SkuPartNumber] = $sku.SkuId
         $targetSkuIds += $sku.SkuId
@@ -26,16 +28,17 @@ if ($targetSkuIds.Count -eq 0) {
     return
 }
 
-Write-Host "✅ Target SKUs: $($targetSkuMap.GetEnumerator() | ForEach-Object { '$($_.Key)' })" -ForegroundColor Green
+Write-Host "✅ Target SKUs mapped: $($targetSkuMap.Keys -join ', ')" -ForegroundColor Green
 
-Write-Host "📥 Fetching data..." -ForegroundColor Cyan
+Write-Host "📥 Fetching comprehensive data..." -ForegroundColor Cyan
 
-# All Entra ID users
+# All Entra ID users with sign-in activity
 $allUsers = Get-MgUser -All -Property "DisplayName,UserPrincipalName,Mail,Country,CreatedDateTime,EmployeeType,UserType,AccountEnabled,SignInActivity,AssignedLicenses"
 
-# Exchange mailboxes
+# Exchange mailboxes for classification
+Write-Host "  → Exchange mailboxes..." -ForegroundColor Cyan
 Connect-ExchangeOnline -ShowBanner:$false
-$exchangeMailboxes = Get-EXOMailbox -ResultSize Unlimited -Properties RecipientTypeDetails,PrimarySmtpAddress | 
+$exchangeMailboxes = Get-EXOMailbox -ResultSize Unlimited -Properties RecipientTypeDetails,PrimarySmtpAddress |
     Select-Object DisplayName, UserPrincipalName, RecipientTypeDetails, PrimarySmtpAddress
 $mailboxMap = @{}
 foreach ($mbx in $exchangeMailboxes) {
@@ -44,39 +47,49 @@ foreach ($mbx in $exchangeMailboxes) {
 }
 Disconnect-ExchangeOnline -Confirm:$false
 
-# Service principals
+# Service principals (non-human app identities)
+Write-Host "  → Service principals..." -ForegroundColor Cyan
 $servicePrincipals = Get-MgServicePrincipal -All -Property "DisplayName,AppId,AccountEnabled,CreatedDateTime"
 
 $totalUsers = $allUsers.Count
-Write-Host "✅ $totalUsers users + $($servicePrincipals.Count) service principals" -ForegroundColor Green
+Write-Host "✅ Retrieved: $totalUsers users + $($servicePrincipals.Count) service principals" -ForegroundColor Green
 
-# On-prem AD lastLogon
-Write-Host "🔄 AD lastLogon data..." -ForegroundColor Cyan
+# On-prem AD lastLogon (backup for hybrid)
+Write-Host "🔄 On-prem AD lastLogon (backup)..." -ForegroundColor Cyan
 $adUsers = Get-ADUser -Filter * -Properties lastLogonTimestamp,UserPrincipalName | ForEach-Object {
-    [PSCustomObject]@{ UserPrincipalName = $_.UserPrincipalName; LastLogon = if ($_.lastLogonTimestamp) { [DateTime]::FromFileTime($_.lastLogonTimestamp) } }
+    [PSCustomObject]@{
+        UserPrincipalName = $_.UserPrincipalName
+        LastLogon = if ($_.lastLogonTimestamp) { [DateTime]::FromFileTime($_.lastLogonTimestamp) }
+    }
 }
 $adUserMap = @{}
 foreach ($entry in $adUsers) {
-    if (-not $adUserMap[$entry.UserPrincipalName]) { $adUserMap[$entry.UserPrincipalName] = $entry.LastLogon }
+    if (-not $adUserMap.ContainsKey($entry.UserPrincipalName)) {
+        $adUserMap[$entry.UserPrincipalName] = $entry.LastLogon
+    }
 }
 
-# Build report
-Write-Host "🔎 Analyzing E5 licenses..." -ForegroundColor Cyan
+# Build COMPLETE report
+Write-Host "🔎 Building E5 license report (Entra sign-ins prioritized)..." -ForegroundColor Cyan
 $report = @()
+$userCounter = 0
 
 foreach ($user in $allUsers) {
-    # Target E5 licenses only
+    $percent = [math]::Round(($userCounter / $totalUsers) * 100)
+    Write-Progress -Activity "Processing Users" -Status "$($userCounter+1)/$totalUsers" -PercentComplete $percent
+
+    # TARGET E5 SKUs ONLY
     $targetLicenses = foreach ($lic in $user.AssignedLicenses) {
-        if ($targetSkuIds -contains $lic.SkuId) { $targetSkuMap[[string]$skuIdToName[$lic.SkuId]] }
+        if ($targetSkuIds -contains $lic.SkuId) { $targetSkuMap[$skuIdToName[$lic.SkuId]] }
     }
-    $licenseStr = if ($targetLicenses) { ($targetLicenses | Select-Object -Unique) -join ", " } else { "❌ No Target SKUs" }
-    $hasTargetSku = [bool]$targetLicenses
+    $targetSkuStr = if ($targetLicenses) { ($targetLicenses | Select-Object -Unique) -join ", " } else { "❌ No E5 SKUs" }
+    $hasE5 = [bool]$targetLicenses
 
     # Mailbox classification
     $mailboxType = "👤 Regular User"
     $keys = @($user.UserPrincipalName, $user.Mail)
     foreach ($key in $keys) {
-        if ($key -and $mailboxMap[$key]) {
+        if ($key -and $mailboxMap.ContainsKey($key)) {
             $rt = $mailboxMap[$key]
             $mailboxType = switch ($rt) {
                 "SharedMailbox" { "🔸 Shared Mailbox" }
@@ -88,38 +101,59 @@ foreach ($user in $allUsers) {
         }
     }
 
-    # Sign-ins
-    $entraSignIn = if ($user.SignInActivity?.LastSignInDateTime) { 
-        [datetime]$user.SignInActivity.LastSignInDateTime | Get-Date -Format "yyyy-MM-dd HH:mm" 
+    # ENTRA ID Sign-In (PRIMARY - cloud M365 activity)
+    $entraLast = $user.SignInActivity?.LastSignInDateTime
+    $entraStr = if ($entraLast) {
+        [datetime]$entraLast | Get-Date -Format "yyyy-MM-dd HH:mm"
     } else { "Never" }
-    $adSignIn = $adUserMap[$user.UserPrincipalName]
-    $adSignInStr = if ($adSignIn) { $adSignIn.ToString("yyyy-MM-dd HH:mm") } else { "Not Found" }
-    $daysSinceAD = if ($adSignIn) { [math]::Round((Get-Date - $adSignIn).TotalDays) } else { "N/A" }
+    $daysEntra = if ($entraLast) {
+        [math]::Round((Get-Date - [datetime]$entraLast).TotalDays, 1)
+    } else { "N/A" }
 
-    # Status
+    # AD Backup
+    $adLast = $adUserMap[$user.UserPrincipalName]
+    $adStr = if ($adLast) { $adLast.ToString("yyyy-MM-dd HH:mm") } else { "N/A" }
+
+    # Combined LastSignIn (Entra > AD)
+    $primarySignIn = if ($entraStr -ne "Never") {
+        "☁️ Entra: $entraStr (${daysEntra}days)"
+    } elseif ($adStr -ne "N/A") {
+        "🏠 AD: $adStr"
+    } else {
+        "🚫 Never"
+    }
+
+    # Status flags
     $accountStatus = if ($user.AccountEnabled) { "✅ Enabled" } else { "❌ Disabled" }
-    $licenseStatus = if ($hasTargetSku) { "✅ E5 Licensed" } else { "❌ No E5" }
-    $created = if ($user.CreatedDateTime) { [datetime]$user.CreatedDateTime | Get-Date -Format "yyyy-MM-dd" } else { "Unknown" }
+    $licenseStatus = if ($hasE5) { "✅ E5 Licensed" } else { "❌ No E5" }
+
+    $createdDate = if ($user.CreatedDateTime) {
+        [datetime]$user.CreatedDateTime | Get-Date -Format "yyyy-MM-dd"
+    } else { "Unknown" }
 
     $report += [PSCustomObject]@{
         ObjectType        = "User"
         MailboxType       = $mailboxType
         DisplayName       = $user.DisplayName
         UPN                = $user.UserPrincipalName
-        Email              = $user.Mail
+        Email              = $user.Mail ?? ""
         AccountStatus     = $accountStatus
         LicenseStatus     = $licenseStatus
-        TargetSKUs        = $licenseStr
-        Entra_LastSignIn  = $entraSignIn
-        AD_LastSignIn     = $adSignInStr
-        DaysSince_AD      = $daysSinceAD
-        Created           = $created
+        Target_E5_SKUs    = $targetSkuStr
+        LastSignIn        = $primarySignIn
+        Entra_LastSignIn  = $entraStr
+        DaysSince_Entra   = $daysEntra
+        AD_LastSignIn     = $adStr
+        CreatedDate       = $createdDate
         Country           = $user.Country ?? ""
         EmployeeType      = $user.EmployeeType ?? "Unknown"
+        UserType          = $user.UserType ?? "Member"
     }
+    $userCounter++
 }
 
-# Service Principals (no E5 licenses)
+# Service Principals
+Write-Host "➕ Adding Service Principals..." -ForegroundColor Cyan
 foreach ($sp in $servicePrincipals) {
     $report += [PSCustomObject]@{
         ObjectType        = "ServicePrincipal"
@@ -129,29 +163,42 @@ foreach ($sp in $servicePrincipals) {
         Email              = ""
         AccountStatus     = if ($sp.AccountEnabled) { "✅ Enabled" } else { "❌ Disabled" }
         LicenseStatus     = "N/A"
-        TargetSKUs        = "N/A"
+        Target_E5_SKUs    = "N/A"
+        LastSignIn        = "N/A"
         Entra_LastSignIn  = "N/A"
+        DaysSince_Entra   = "N/A"
         AD_LastSignIn     = "N/A"
-        DaysSince_AD      = "N/A"
-        Created           = if ($sp.CreatedDateTime) { [datetime]$sp.CreatedDateTime | Get-Date -Format "yyyy-MM-dd" } else { "Unknown" }
+        CreatedDate       = if ($sp.CreatedDateTime) {
+            [datetime]$sp.CreatedDateTime | Get-Date -Format "yyyy-MM-dd"
+        } else { "Unknown" }
         Country           = ""
         EmployeeType      = "Service Account"
+        UserType          = "App"
     }
 }
 
-# Stats & Export
-$e5Users = ($report | Where-Object { $_.LicenseStatus -eq "✅ E5 Licensed" }).Count
+Write-Progress -Activity "Complete" -Completed
+
+# FINAL STATS
+$e5Total = ($report | Where-Object { $_.LicenseStatus -eq "✅ E5 Licensed" }).Count
 $disabledE5 = ($report | Where-Object { $_.LicenseStatus -eq "✅ E5 Licensed" -and $_.AccountStatus -eq "❌ Disabled" }).Count
 $e5Shared = ($report | Where-Object { $_.LicenseStatus -eq "✅ E5 Licensed" -and $_.MailboxType -like "*Shared*" }).Count
+$inactiveE5_90d = ($report | Where-Object {
+    $_.LicenseStatus -eq "✅ E5 Licensed" -and
+    [double]($_.DaysSince_Entra -replace "N/A", "0") -gt 90
+}).Count
 
-Write-Host "📊 E5 STATS:" -ForegroundColor Cyan
-Write-Host "   E5 Users: $e5Users" -ForegroundColor Green
-Write-Host "   Disabled E5: $disabledE5 ⚠️" -ForegroundColor Yellow
-Write-Host "   E5 Shared MB: $e5Shared ⚠️" -ForegroundColor Yellow
+Write-Host "`n📊 E5 LICENSE LANDSCAPE SUMMARY:" -ForegroundColor Cyan
+Write-Host "   Total E5 Users: $e5Total" -ForegroundColor Green
+Write-Host "   ❌ Disabled E5: $disabledE5" -ForegroundColor Red
+Write-Host "   🔸 E5 Shared MB: $e5Shared" -ForegroundColor Magenta
+Write-Host "   😴 E5 Inactive 90+ days: $inactiveE5_90d" -ForegroundColor Yellow
 
-$timestamp = Get-Date -Format "yyyyMMdd-HHmm"
-$exportPath = "E5_License_Landscape_$timestamp.csv"
-$report | Sort-Object LicenseStatus desc, AccountStatus, MailboxType, DisplayName | Export-Csv -Path $exportPath -NoTypeInformation -Encoding UTF8
+# EXPORT
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$exportPath = "E5_License_Report_$timestamp.csv"
+$report | Sort-Object @{Expression='LicenseStatus'; Descending=$true}, AccountStatus, MailboxType, DisplayName |
+    Export-Csv -Path $exportPath -NoTypeInformation -Encoding UTF8
 
-Write-Host "✅ E5 REPORT SAVED: $exportPath" -ForegroundColor Green
-Write-Host "   Target SKUs: ENTERPRISEPREMIUM + SPE_E5 only" -ForegroundColor Cyan
+Write-Host "`n✅ FULL REPORT SAVED: $exportPath" -ForegroundColor Green
+Write-Host "   Columns: Target_E5_SKUs | AccountStatus | MailboxType | LastSignIn (Entra+AD)" -ForegroundColor Cyan
