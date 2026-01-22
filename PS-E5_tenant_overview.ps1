@@ -99,12 +99,17 @@ foreach ($user in $allUsers) {
         }
     }
 
-    # ENTRA ID Sign-In (SAFE date handling)
-    $entraLastRaw = $user.SignInActivity?.LastSignInDateTime
+    # ENTRA ID Sign-In (BULLETPROOF - handles '-', N/A, strings, etc.)
     $entraStr     = "Never"
     $daysEntra    = "N/A"
+    $entraLastRaw = $user.SignInActivity?.LastSignInDateTime
 
-    if ($entraLastRaw -and $entraLastRaw -is [DateTime]) {
+    if ($entraLastRaw -and
+        $entraLastRaw -ne "-" -and
+        $entraLastRaw -ne "N/A" -and
+        $entraLastRaw -isnot [string] -and
+        $entraLastRaw -is [DateTime]) {
+
         $entraDt   = [datetime]$entraLastRaw
         $entraStr  = $entraDt.ToString("yyyy-MM-dd HH:mm")
         $daysEntra = [math]::Round((Get-Date - $entraDt).TotalDays, 1)
@@ -121,9 +126,11 @@ foreach ($user in $allUsers) {
     $accountStatus = if ($user.AccountEnabled) { "✅ Enabled" } else { "❌ Disabled" }
     $licenseStatus = if ($hasE5) { "✅ E5 Licensed" } else { "❌ No E5" }
 
-    $createdDate = if ($user.CreatedDateTime -and $user.CreatedDateTime -is [DateTime]) {
-        [datetime]$user.CreatedDateTime | Get-Date -Format "yyyy-MM-dd"
-    } else { "Unknown" }
+    # CreatedDate (also safe)
+    $createdDate = "Unknown"
+    if ($user.CreatedDateTime -and $user.CreatedDateTime -is [DateTime]) {
+        $createdDate = [datetime]$user.CreatedDateTime | Get-Date -Format "yyyy-MM-dd"
+    }
 
     $report += [PSCustomObject]@{
         ObjectType             = "User"
@@ -149,13 +156,14 @@ foreach ($user in $allUsers) {
 
 Write-Progress -Activity "Complete" -Completed
 
-# FINAL STATS
+# FINAL STATS (safe numeric check)
 $e5Total    = ($report | Where-Object { $_.LicenseStatus -eq "✅ E5 Licensed" }).Count
 $disabledE5 = ($report | Where-Object { $_.LicenseStatus -eq "✅ E5 Licensed" -and $_.AccountStatus -eq "❌ Disabled" }).Count
 $e5Shared   = ($report | Where-Object { $_.LicenseStatus -eq "✅ E5 Licensed" -and $_.RecipientTypeDetails -eq "SharedMailbox" }).Count
 $inactiveE5_90d = ($report | Where-Object {
     $_.LicenseStatus -eq "✅ E5 Licensed" -and
     $_.DaysSince_Entra -ne "N/A" -and
+    $_.DaysSince_Entra -match '^\d+(\.\d+)?$' -and
     [double]$_.DaysSince_Entra -gt 90
 }).Count
 
